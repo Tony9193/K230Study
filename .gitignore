@@ -1,0 +1,15 @@
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# AI 模型文件（体积大，不适合放 Git）
+*.bin
+*.kmodel
+
+# IDE 临时文件
+.vscode/settings.json
