@@ -67,11 +67,13 @@ HAND_LABELS = ["hand"]
 HAND_DET_INPUT_SIZE = [512, 512]
 HAND_KP_INPUT_SIZE = [256, 256]
 HAND_ANCHORS = [26, 27, 53, 52, 75, 71, 80, 99, 106, 82, 99, 134, 140, 113, 161, 172, 245, 276]
-POINTER_GESTURES = set(["one", "gun", "yeah"])
+# （POINTER_GESTURES 已移除：手势判断留给 classify_gesture 内部决定，指针追踪不再依赖手势类型）
 POINTER_SMOOTH_ALPHA = 0.80
 
 # 调试与稳定性参数
-DEBUG_RUNTIME = True
+# 注意：DEBUG_RUNTIME=True 会在每帧执行字符串格式化和调试文字绘制，有轻微性能开销。
+# 调试完毕后建议改为 False。
+DEBUG_RUNTIME = False  # 改为 True 可开启屏幕/串口调试输出
 DEBUG_PRINT_INTERVAL_MS = 1000
 FORCE_GC_INTERVAL_FRAMES = 20
 SHRINK_POOL_INTERVAL_FRAMES = 120
@@ -211,6 +213,17 @@ if AI_RUNTIME_AVAILABLE:
             del input_tensor
             return self.output_tensor
 
+        def deinit(self):
+            # 显式释放 K230 NPU 侧的 ai2d 对象、中间输出 tensor 和 builder。
+            # 不释放这些对象，KPU 内存碎片会逐帧积累，最终导致内存不足。
+            if self.builder is not None:
+                del self.builder
+                self.builder = None
+            if self.output_tensor is not None:
+                del self.output_tensor
+                self.output_tensor = None
+            del self.ai2d
+
 
     class SimpleAIBase:
         def __init__(self, kmodel_path):
@@ -229,6 +242,10 @@ if AI_RUNTIME_AVAILABLE:
             return outputs
 
         def deinit(self):
+            # 先清 ai2d 相关 NPU 资源，再删 kpu，最后强制 GC + 内存池收缩。
+            # 顺序很重要：ai2d 依赖 kpu 上下文，必须先于 kpu 释放。
+            if hasattr(self, 'ai2d') and self.ai2d is not None:
+                self.ai2d.deinit()
             del self.kpu
             gc.collect()
             nn.shrink_memory_pool()
@@ -561,10 +578,12 @@ sensor.run()
 # 有些开发板在反复运行脚本时，图层内容可能不会自动干净地清掉，
 # 所以先画一张“全透明空白图”覆盖一下，避免看到上一次程序的残影。
 try:
+    # 800×480×4字节 = 约1.5MB，用完后必须立即 del，不然这块内存要等下次GC才释放。
     clear_img = image.Image(DISPLAY_WIDTH, DISPLAY_HEIGHT, image.ARGB8888)
     clear_img.clear()
     Display.show_image(clear_img, layer=Display.LAYER_OSD1, alpha=0)
     Display.show_image(clear_img, layer=Display.LAYER_OSD2, alpha=0)
+    del clear_img  # ← 立即释放，避免1.5MB长期驻留堆里
 except Exception:
     pass
 
@@ -681,16 +700,24 @@ def check_button_click(pos, buttons):
             return label
     return None
 
+# 表达式最大长度限制，防止无限追加字符吃内存。
+EXPR_MAX_LEN = 40
+
+
 def calculate(expr):
     """
     计算字符串表达式。
     这里直接用了 eval，优点是代码短、容易看懂；
     缺点是它会执行字符串里的 Python 表达式，所以更适合教学示例，
     不适合拿去处理不可信输入。
+
+    注意：必须捕获所有 Exception，否则 eval('9**9**9') 会抛 OverflowError，
+    导致整个程序崩溃！
     """
     try:
         return str(eval(expr))  # 使用 eval 解析表达式，例如 "1+2*3"
-    except (SyntaxError, ZeroDivisionError, NameError):
+    except Exception:
+        # 统一捕获所有异常（含 OverflowError, MemoryError, TypeError 等）
         return "Error"
 
 
@@ -776,8 +803,12 @@ try:
                 last_step = "snap_ch2"
                 ai_img = sensor.snapshot(chn=CAM_CHN_ID_2)
                 last_step = "ai_infer"
-                pointer_state = hand_tracker.get_pointer_state(ai_img.to_numpy_ref())
-                del ai_img
+                # 用 try/finally 保证无论推理是否异常，ai_img 都能被释放。
+                # 否则推理抛异常时帧缓冲区会泄漏，多次后触发 OOM。
+                try:
+                    pointer_state = hand_tracker.get_pointer_state(ai_img.to_numpy_ref())
+                finally:
+                    del ai_img
                 if pointer_state:
                     finger_pos = pointer_state["point"]
                     pointer_gesture = pointer_state["gesture"]
@@ -898,7 +929,9 @@ try:
                         result = calculate(expression)
                         expression = result
                 else:
-                    expression += btn
+                    # 普通数字/运算符：拼入表达式，但限制最大长度，防止无限输入吃内存。
+                    if len(expression) < EXPR_MAX_LEN:
+                        expression += btn
             clicked_button = None
         # 颜色追踪/AI：必须长按1秒才触发一次，防止误触
         elif finger_pos:
@@ -916,7 +949,8 @@ try:
                             result = calculate(expression)
                             expression = result
                     else:
-                        expression += btn
+                        if len(expression) < EXPR_MAX_LEN:
+                            expression += btn
                     last_click_time = current_time
                     clicked_button = None
             else:
